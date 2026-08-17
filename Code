@@ -5,6 +5,7 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib import request, parse
@@ -43,6 +44,391 @@ class ThreatIndicator:
     confidence: float = 0.0
     tags: List[str] = field(default_factory=list)
     mitre: List[str] = field(default_factory=list)
+    enrichment: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SecurityAlert:
+    alert_id: str
+    title: str
+    severity: str
+    source: str
+    indicator: str
+    summary: str
+    status: str = "open"
+
+
+@dataclass
+class AnalystCase:
+    case_id: str
+    title: str
+    priority: str
+    status: str
+    created_at: str
+    updated_at: str
+    risk_score: int
+    severity: str
+    summary: str
+    indicators: List[str]
+    source_text_snippet: str
+    related_cases: List[str] = field(default_factory=list)
+
+
+class CaseTriageManager:
+    """Tracks CTI investigations as a triage queue across analyst workflows."""
+
+    def __init__(self, storage_path: str | Path = "cti_memory.json") -> None:
+        self.storage_path = Path(storage_path)
+
+    def _load_payload(self) -> Dict[str, Any]:
+        if not self.storage_path.exists():
+            return {"cases": []}
+        try:
+            with self.storage_path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+        return {"cases": []}
+
+    def _save_payload(self, payload: Dict[str, Any]) -> None:
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.storage_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+
+    def load_cases(self) -> List[Dict[str, Any]]:
+        payload = self._load_payload()
+        cases = payload.get("cases", [])
+        return cases if isinstance(cases, list) else []
+
+    def add_case(self, case: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._load_payload()
+        cases = payload.get("cases", [])
+        if not isinstance(cases, list):
+            cases = []
+        cases.append(case)
+        payload["cases"] = cases
+        self._save_payload(payload)
+        return case
+
+    def update_status(self, case_id: str, status: str) -> Dict[str, Any] | None:
+        payload = self._load_payload()
+        cases = payload.get("cases", [])
+        for case in cases:
+            if case.get("case_id") == case_id:
+                case["status"] = status
+                case["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._save_payload(payload)
+                return case
+        return None
+
+    def queue(self, limit: int = 10) -> List[Dict[str, Any]]:
+        cases = sorted(self.load_cases(), key=lambda item: self._queue_sort_key(item), reverse=True)
+        return cases[:limit]
+
+    def transition_case(self, case_id: str, new_status: str, analyst: str = "system", note_text: str | None = None) -> Dict[str, Any] | None:
+        allowed_transitions = {
+            "new": {"assigned", "in_progress", "escalated", "closed"},
+            "assigned": {"in_progress", "escalated", "closed"},
+            "in_progress": {"assigned", "escalated", "closed"},
+            "escalated": {"in_progress", "closed"},
+            "closed": {"closed"},
+        }
+        normalized_status = (new_status or "new").strip().lower().replace(" ", "_")
+        payload = self._load_payload()
+        cases = payload.get("cases", [])
+        for case in cases:
+            if case.get("case_id") != case_id:
+                continue
+            current_status = str(case.get("status", "new")).lower().replace(" ", "_")
+            if current_status not in allowed_transitions and normalized_status not in allowed_transitions.get(current_status, set()):
+                valid = ", ".join(sorted({status for states in allowed_transitions.values() for status in states}))
+                raise ValueError(f"Invalid status transition from '{current_status}' to '{normalized_status}'. Allowed states: {valid}")
+            if normalized_status not in allowed_transitions.get(current_status, set()):
+                if current_status != normalized_status:
+                    raise ValueError(f"Invalid status transition from '{current_status}' to '{normalized_status}'.")
+            case["status"] = normalized_status
+            case["updated_at"] = datetime.now(timezone.utc).isoformat()
+            if note_text and note_text.strip():
+                notes = case.setdefault("notes", [])
+                notes.append({
+                    "analyst": analyst,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "text": note_text.strip(),
+                })
+            if analyst and analyst != "system":
+                case["assignee"] = analyst
+            self._save_payload(payload)
+            return case
+        return None
+
+    def find_related_cases(self, case: Dict[str, Any], limit: int = 5) -> List[Dict[str, Any]]:
+        current_indicators = {
+            str(value).lower()
+            for value in case.get("indicators", [])
+            if isinstance(value, str)
+        }
+        summary_text = (case.get("summary") or "").lower()
+        match_keywords = ["phishing", "payroll", "secure", "malware", "ransomware", "loader", "credential"]
+        matches: List[Dict[str, Any]] = []
+
+        for prior_case in self.load_cases():
+            if prior_case.get("case_id") == case.get("case_id"):
+                continue
+
+            prior_indicators = {
+                str(value).lower()
+                for value in prior_case.get("indicators", [])
+                if isinstance(value, str)
+            }
+            overlap = len(current_indicators & prior_indicators)
+
+            if overlap == 0 and prior_case.get("summary"):
+                prior_summary = (prior_case.get("summary") or "").lower()
+                if any(keyword in prior_summary for keyword in match_keywords) and any(keyword in summary_text for keyword in match_keywords):
+                    overlap = 1
+
+            if overlap > 0:
+                matches.append({
+                    "case_id": prior_case.get("case_id"),
+                    "title": prior_case.get("title"),
+                    "severity": prior_case.get("severity"),
+                    "risk_score": prior_case.get("risk_score"),
+                    "match_count": overlap,
+                    "assignee": prior_case.get("assignee", "unassigned"),
+                })
+
+        matches = sorted(matches, key=lambda item: (item.get("match_count", 0), item.get("risk_score", 0)), reverse=True)
+        return matches[:limit]
+
+    def assign_case(self, case_id: str, assignee: str) -> Dict[str, Any] | None:
+        payload = self._load_payload()
+        cases = payload.get("cases", [])
+        for case in cases:
+            if case.get("case_id") == case_id:
+                case["assignee"] = assignee
+                case["status"] = "assigned"
+                case["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._save_payload(payload)
+                return case
+        return None
+
+    def add_note(self, case_id: str, note_text: str, analyst: str = "analyst") -> Dict[str, Any] | None:
+        if not note_text.strip():
+            return None
+        payload = self._load_payload()
+        cases = payload.get("cases", [])
+        for case in cases:
+            if case.get("case_id") == case_id:
+                notes = case.setdefault("notes", [])
+                notes.append({
+                    "analyst": analyst,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "text": note_text.strip(),
+                })
+                case["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._save_payload(payload)
+                return case
+        return None
+
+    @staticmethod
+    def _queue_sort_key(item: Dict[str, Any]) -> tuple[int, str]:
+        severity_rank = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+        return (severity_rank.get(item.get("severity", "Low"), 0), item.get("updated_at", ""))
+
+
+class ThreatFeedClient:
+    """Optional live threat intel enrichment with graceful fallback."""
+
+    LOCAL_FEED = {
+        "185.220.101.42": {
+            "provider": "local-feed",
+            "reputation": "malicious",
+            "confidence": 0.92,
+            "category": "phishing-c2",
+            "note": "Known malicious infrastructure matching phishing and C2 activity",
+        },
+        "secure-payroll.co": {
+            "provider": "local-feed",
+            "reputation": "suspicious",
+            "confidence": 0.91,
+            "category": "phishing",
+            "note": "Domain overlaps with credential phishing lure infrastructure",
+        },
+        "payroll-login-secure.co": {
+            "provider": "local-feed",
+            "reputation": "suspicious",
+            "confidence": 0.93,
+            "category": "phishing",
+            "note": "Impersonation domain observed in active lure infrastructure",
+        },
+        "lockfiles-update.net": {
+            "provider": "local-feed",
+            "reputation": "malicious",
+            "confidence": 0.89,
+            "category": "ransomware-loader",
+            "note": "Infrastructure historically associated with ransomware loader behavior",
+        },
+    }
+
+    @staticmethod
+    def _normalize_domain(value: str) -> str:
+        return value.lower().replace("[.]", ".").strip(".")
+
+    @staticmethod
+    def _feed_result(provider: str, reputation: str, confidence: float, category: str, note: str) -> Dict[str, Any]:
+        return {
+            "provider": provider,
+            "reputation": reputation,
+            "confidence": confidence,
+            "category": category,
+            "note": note,
+        }
+
+    def get_ip_intel(self, ip_value: str) -> Dict[str, Any]:
+        key = ip_value.strip().lower()
+        if key in self.LOCAL_FEED:
+            record = self.LOCAL_FEED[key]
+            return self._feed_result(
+                record.get("provider", "local-feed"),
+                record.get("reputation", "unknown"),
+                record.get("confidence", 0.5),
+                record.get("category", "unknown"),
+                record.get("note", "Local intelligence match"),
+            )
+
+        api_key = os.getenv("ABUSEIPDB_API_KEY")
+        if api_key:
+            try:
+                endpoint = "https://api.abuseipdb.com/api/v2/check"
+                req = request.Request(
+                    f"{endpoint}?ipAddress={ip_value}&maxAgeInDays=90",
+                    headers={
+                        "Key": api_key,
+                        "Accept": "application/json",
+                    },
+                )
+                with request.urlopen(req, timeout=20) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    data = body.get("data", {})
+                    return self._feed_result(
+                        "abuseipdb",
+                        "malicious" if data.get("abuseConfidenceScore", 0) >= 50 else "unknown",
+                        float(data.get("abuseConfidenceScore", 0)) / 100.0,
+                        data.get("usageType", "unknown"),
+                        data.get("countryName", "AbuseIPDB enrichment available"),
+                    )
+            except Exception:
+                pass
+
+        return self._feed_result("local", "unknown", 0.0, "not-enriched", "No live IP reputation key configured")
+
+    def get_domain_intel(self, domain_value: str) -> Dict[str, Any]:
+        key = self._normalize_domain(domain_value)
+        if key in self.LOCAL_FEED:
+            record = self.LOCAL_FEED[key]
+            return self._feed_result(
+                record.get("provider", "local-feed"),
+                record.get("reputation", "unknown"),
+                record.get("confidence", 0.5),
+                record.get("category", "unknown"),
+                record.get("note", "Domain intelligence match"),
+            )
+
+        return self._feed_result("local", "unknown", 0.0, "not-enriched", "No live enrichment available for this domain")
+
+    def get_hash_intel(self, hash_value: str) -> Dict[str, Any]:
+        key = hash_value.lower()
+        if key.startswith("9f1c4a2e5b6d7a88d0e9f9b2c1d3a4f5"):
+            return self._feed_result(
+                "local-feed",
+                "malicious",
+                0.97,
+                "malware",
+                "Hash matches a known suspicious file sample in the local dataset",
+            )
+
+        api_key = os.getenv("VIRUSTOTAL_API_KEY")
+        if api_key:
+            try:
+                endpoint = f"https://www.virustotal.com/api/v3/files/{hash_value}"
+                req = request.Request(endpoint, headers={"x-apikey": api_key})
+                with request.urlopen(req, timeout=20) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    data = body.get("data", {}).get("attributes", {})
+                    positives = data.get("last_analysis_stats", {}).get("malicious", 0)
+                    total = max(1, sum(data.get("last_analysis_stats", {}).values()))
+                    return self._feed_result(
+                        "virustotal",
+                        "malicious" if positives > 0 else "unknown",
+                        min(1.0, positives / max(1, total)),
+                        "malware",
+                        "VirusTotal enrichment available",
+                    )
+            except Exception:
+                pass
+
+        return self._feed_result("local", "unknown", 0.0, "not-enriched", "Hash enrichment requires a malware intel provider")
+
+    def enrich_indicator(self, indicator: ThreatIndicator) -> Dict[str, Any]:
+        if indicator.type == "ip":
+            return self.get_ip_intel(indicator.value)
+        if indicator.type == "domain":
+            return self.get_domain_intel(indicator.value)
+        if indicator.type == "url":
+            parsed = parse.urlparse(indicator.value)
+            host = parsed.netloc.lower().split(":")[0]
+            return self.get_domain_intel(host)
+        if indicator.type == "hash":
+            return self.get_hash_intel(indicator.value)
+        if indicator.type == "email":
+            return self._feed_result("local", "unknown", 0.0, "social-engineering", "Email enrichment requires a mail reputation source")
+        return self._feed_result("local", "unknown", 0.0, "not-enriched", "No live enrichment available")
+
+
+class AlertWorkflow:
+    """Generates analyst alerts from risk and threat intel results."""
+
+    @staticmethod
+    def generate(indicators: List[ThreatIndicator], risk: Dict[str, Any]) -> List[Dict[str, Any]]:
+        alerts: List[Dict[str, Any]] = []
+
+        if risk.get("score", 0) >= 80:
+            alerts.append({
+                "alert_id": f"ALERT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+                "title": "Critical CTI incident",
+                "severity": "Critical",
+                "source": "risk-engine",
+                "indicator": "campaign",
+                "summary": "High-confidence phishing and malware indicators indicate active compromise or coordinated lure activity.",
+                "status": "open",
+            })
+
+        for indicator in indicators:
+            if indicator.enrichment.get("reputation") == "malicious":
+                alerts.append({
+                    "alert_id": f"ALERT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{len(alerts)}",
+                    "title": f"Malicious {indicator.type.upper()} observed",
+                    "severity": "High" if risk.get("score", 0) >= 70 else "Medium",
+                    "source": indicator.enrichment.get("provider", "local"),
+                    "indicator": indicator.value,
+                    "summary": indicator.enrichment.get("note", "Malicious enrichment match detected."),
+                    "status": "open",
+                })
+
+        if not alerts:
+            alerts.append({
+                "alert_id": f"ALERT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+                "title": "Monitoring only",
+                "severity": "Low",
+                "source": "triage",
+                "indicator": "watchlist",
+                "summary": "No malicious enrichment matches were found in the current report; the case remains under watch.",
+                "status": "monitor",
+            })
+
+        return alerts
 
 
 class CollectorAgent:
@@ -231,7 +617,7 @@ class ReportingAgent:
         except Exception:
             return None
 
-    def generate(self, indicators: List[ThreatIndicator], risk: Dict[str, Any], source_text: str) -> Dict[str, Any]:
+    def generate(self, indicators: List[ThreatIndicator], risk: Dict[str, Any], source_text: str, alerts: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
         summary_lines = [
             "Cyber Threat Intelligence Assessment",
             "==================================",
@@ -246,12 +632,17 @@ class ReportingAgent:
             for ind in indicators:
                 summary_lines.append(f"- {ind.type.upper()}: {ind.value} | confidence={ind.confidence:.2f} | tags={', '.join(ind.tags) or 'none'} | MITRE={', '.join(ind.mitre)}")
 
+        if alerts:
+            summary_lines.extend(["", "Generated alerts:"])
+            for alert in alerts:
+                summary_lines.append(f"- {alert['title']} [{alert['severity']}] | {alert['indicator']} | {alert['summary']}")
+
         fallback_summary = "\n".join(summary_lines)
 
         prompt = (
             "You are a cyber threat intelligence analyst. Based on these indicators and risk context, "
             "produce a concise analyst brief with likely campaign type, suspected threats, and recommended actions.\n\n"
-            f"Source text:\n{source_text}\n\nIndicators:\n{json.dumps([asdict(i) for i in indicators], indent=2)}\n\nRisk score:\n{json.dumps(risk, indent=2)}"
+            f"Source text:\n{source_text}\n\nIndicators:\n{json.dumps([asdict(i) for i in indicators], indent=2)}\n\nRisk score:\n{json.dumps(risk, indent=2)}\n\nAlerts:\n{json.dumps(alerts or [], indent=2)}"
         )
 
         llm_summary = self._call_azure_openai(prompt)
@@ -265,25 +656,73 @@ class ReportingAgent:
             "indicator_count": len(indicators),
             "summary": final_summary,
             "indicators": [asdict(indicator) for indicator in indicators],
+            "alerts": alerts or [],
         }
 
 
 class AgenticCTIResearcher:
     """High-level orchestration pipeline for CTI workflows."""
 
-    def __init__(self) -> None:
+    def __init__(self, storage_path: str | Path = "cti_memory.json") -> None:
         self.collector = CollectorAgent()
         self.enricher = EnrichmentAgent()
         self.contextualizer = ContextualizationAgent()
         self.risk_agent = RiskScoringAgent()
         self.reporter = ReportingAgent()
+        self.feed_client = ThreatFeedClient()
+        self.case_manager = CaseTriageManager(storage_path)
 
-    def analyze(self, source_text: str) -> Dict[str, Any]:
+    def analyze(self, source_text: str, assignee: str | None = None, notes: List[str] | None = None) -> Dict[str, Any]:
         indicators = self.collector.collect(source_text)
         indicators = self.enricher.enrich(indicators)
         indicators = self.contextualizer.contextualize(indicators)
+        for indicator in indicators:
+            indicator.enrichment = self.feed_client.enrich_indicator(indicator)
         risk = self.risk_agent.score(indicators)
-        report = self.reporter.generate(indicators, risk, source_text)
+        alerts = AlertWorkflow.generate(indicators, risk)
+        report = self.reporter.generate(indicators, risk, source_text, alerts)
+
+        case_id = f"cti-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{abs(hash(source_text)) % 10000}"
+        priority = "P1" if risk["score"] >= 80 else "P2" if risk["score"] >= 60 else "P3"
+        case_record = {
+            "case_id": case_id,
+            "title": f"{risk['severity']} CTI case",
+            "priority": priority,
+            "status": "new",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "risk_score": risk["score"],
+            "severity": risk["severity"],
+            "summary": report["summary"],
+            "indicators": [f"{ind['type']}:{ind['value']}" for ind in report["indicators"]],
+            "source_text_snippet": source_text[:240],
+            "related_cases": [],
+            "assignee": assignee or "unassigned",
+            "notes": [],
+        }
+        if notes:
+            case_record["notes"] = [{
+                "analyst": assignee or "analyst",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "text": note,
+            } for note in notes if note and note.strip()]
+
+        related_cases = self.case_manager.find_related_cases(case_record)
+        case_record["related_cases"] = [match["case_id"] for match in related_cases]
+        self.case_manager.add_case(case_record)
+
+        final_status = "assigned" if assignee else "new"
+        if assignee:
+            self.case_manager.assign_case(case_id, assignee)
+            case_record["status"] = final_status
+
+        report["case_id"] = case_id
+        report["priority"] = priority
+        report["status"] = final_status
+        report["assignee"] = assignee or "unassigned"
+        report["related_cases"] = related_cases
+        report["notes"] = case_record["notes"]
+        report["case_queue"] = self.case_manager.queue()
         return report
 
 
@@ -298,6 +737,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text", help="Threat report text to analyze")
     parser.add_argument("--file", help="Path to a text file containing the threat report")
     parser.add_argument("--output", help="Optional output path for JSON results")
+    parser.add_argument("--assignee", help="Analyst assigned to the case")
+    parser.add_argument("--note", help="Analyst note to attach to the case")
+    parser.add_argument("--status", help="Move the current case through a workflow state such as assigned, in_progress, escalated, closed")
+    parser.add_argument("--status-note", help="Optional reason or note for a status update")
     return parser.parse_args()
 
 
@@ -305,7 +748,19 @@ def main() -> None:
     args = parse_args()
     source_text = args.text or read_text(args.file)
     researcher = AgenticCTIResearcher()
-    report = researcher.analyze(source_text)
+    notes = [args.note] if args.note else []
+    report = researcher.analyze(source_text, assignee=args.assignee, notes=notes)
+
+    if args.status:
+        case_id = report.get("case_id")
+        if case_id:
+            manager = researcher.case_manager
+            updated = manager.transition_case(case_id, args.status, analyst=args.assignee or "system", note_text=args.status_note)
+            if updated:
+                report["status"] = updated.get("status", report.get("status"))
+                report["assignee"] = updated.get("assignee", report.get("assignee"))
+                report["notes"] = updated.get("notes", report.get("notes", []))
+                report["case_queue"] = manager.queue()
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
